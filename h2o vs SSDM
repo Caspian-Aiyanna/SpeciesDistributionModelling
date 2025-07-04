@@ -1,0 +1,165 @@
+################################################################################
+# Habitat Suitability Comparison: SSDM vs. H2O AutoML
+#
+# Purpose:
+# This script systematically compares habitat suitability outputs from the SSDM
+# package and your H2O AutoML workflow. It quantifies pixel-wise similarity,
+# identifies spatial disagreement, and visualizes where models agree/disagree.
+#
+# Why this is important:
+# Ensemble models (SSDM) and flexible AutoML pipelines may predict different
+# habitat suitability patterns because they combine algorithms differently and
+# handle environmental covariates in unique ways. Understanding where they
+# overlap or diverge provides insight into model uncertainty, algorithm bias,
+# and ecological plausibility.
+#
+# What this script does:
+# 1. Loads each pair of rasters (SSDM vs. H2O) for the same species/individual.
+# 2. Resamples to align extents/resolutions if needed.
+# 3. Computes Pearson & Spearman correlation, RMSE, Jaccard index for hotspot overlap.
+# 4. Saves difference and hotspot rasters.
+# 5. Generates clear comparison plots (correlation, error, overlap) and saves them as JPG.
+# 6. Outputs a summary table for reporting.
+#
+# Results saved in: D:/Harin/Projects/SDM/SDM/All/Results/Compare
+################################################################################
+
+library(terra)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tools)
+
+#Define directories
+ssdm_dir <- "D:/Harin/Projects/SDM/SDM/All/Results/SSDM"
+h2o_dir  <- "D:/Harin/Projects/SDM/SDM/All/Results/H2o"
+out_dir  <- "D:/Harin/Projects/SDM/SDM/All/Results/Compare"
+dir.create(out_dir, showWarnings=FALSE, recursive=TRUE)
+
+# Load files
+ssdm_files <- list.files(ssdm_dir, pattern="\\.tif$", full.names=TRUE)
+h2o_files  <- list.files(h2o_dir,  pattern="\\.tif$", full.names=TRUE)
+
+ssdm_names <- file_path_sans_ext(basename(ssdm_files))
+h2o_names  <- file_path_sans_ext(basename(h2o_files))
+
+#Sort to align by name
+ord1 <- order(ssdm_names)
+ord2 <- order(h2o_names)
+ssdm_files <- ssdm_files[ord1]; ssdm_names <- ssdm_names[ord1]
+h2o_files  <- h2o_files[ord2];  h2o_names  <- h2o_names[ord2]
+
+#Prepare results table
+results <- tibble(
+  dataset  = ssdm_names,
+  pearson  = NA_real_,
+  spearman = NA_real_,
+  rmse     = NA_real_,
+  jaccard  = NA_real_
+)
+
+#Loop through each pair
+for(i in seq_along(ssdm_files)){
+  cat("\nComparing:", ssdm_names[i], "vs", h2o_names[i], "\n")
+  
+  r1 <- rast(ssdm_files[i])
+  r2 <- rast(h2o_files[i])
+  
+  #Align extent/resolution
+  r2 <- resample(r2, r1, method="bilinear")
+  
+  v1 <- values(r1); v2 <- values(r2)
+  idx <- !is.na(v1) & !is.na(v2)
+  
+  #Compute metrics
+  results$pearson[i]  <- cor(v1[idx], v2[idx], method="pearson")
+  results$spearman[i] <- cor(v1[idx], v2[idx], method="spearman")
+  results$rmse[i]     <- sqrt(mean((v1[idx] - v2[idx])^2))
+  
+  #Hotspot Jaccard (top 25%)
+  q1 <- quantile(v1[idx], 0.75)
+  q2 <- quantile(v2[idx], 0.75)
+  h1 <- r1 > q1
+  h2 <- r2 > q2
+  ov <- h1 & h2
+  results$jaccard[i] <- sum(values(ov), na.rm=TRUE) / sum(values(h1 | h2), na.rm=TRUE)
+  
+  #Saving difference and hotspot rasters
+  writeRaster(r2 - r1,
+              file.path(out_dir, paste0("diff_", ssdm_names[i], ".tif")),
+              overwrite=TRUE)
+  writeRaster(h1, file.path(out_dir, paste0("hotspot_ssdm_", ssdm_names[i], ".tif")), overwrite=TRUE)
+  writeRaster(h2, file.path(out_dir, paste0("hotspot_h2o_", ssdm_names[i], ".tif")), overwrite=TRUE)
+  writeRaster(ov, file.path(out_dir, paste0("hotspot_overlap_", ssdm_names[i], ".tif")), overwrite=TRUE)
+}
+
+#Save results table
+write_csv(results, file.path(out_dir, "comparison_metrics.csv"))
+
+#Plot function
+plot_metric <- function(df, metric, ylab, fname){
+  p <- ggplot(df, aes(x=dataset, y=.data[[metric]])) +
+    geom_col(fill="steelblue") +
+    labs(x="Dataset", y=ylab, title=paste(ylab, "Comparison")) +
+    theme(axis.text.x=element_text(angle=45, hjust=1))
+  ggsave(file.path(out_dir, fname), p, width=8, height=4)
+}
+
+plot_metric(results, "pearson",  "Pearson Correlation",  "pearson_comparison.jpg")
+plot_metric(results, "spearman", "Spearman Correlation", "spearman_comparison.jpg")
+plot_metric(results, "rmse",     "RMSE",                 "rmse_comparison.jpg")
+plot_metric(results, "jaccard",  "Hotspot Jaccard",      "jaccard_comparison.jpg")
+
+#Difference stats
+diff_files <- list.files(out_dir, pattern="^diff_.*\\.tif$", full.names=TRUE)
+ds_names   <- tools::file_path_sans_ext(basename(diff_files)) %>% sub("^diff_", "", .)
+
+diff_stats <- lapply(seq_along(diff_files), function(i) {
+  v <- values(rast(diff_files[i]))
+  v <- v[!is.na(v)]
+  data.frame(
+    dataset   = ds_names[i],
+    mean_diff = mean(v),
+    sd_diff   = sd(v),
+    pct_small = mean(abs(v) < 0.05)
+  )
+}) %>% bind_rows()
+
+write_csv(diff_stats, file.path(out_dir, "difference_stats.csv"))
+
+#Plot mean diff ± SD
+p_mean <- ggplot(diff_stats, aes(x=dataset, y=mean_diff)) +
+  geom_col(fill="darkorange") +
+  geom_errorbar(aes(ymin=mean_diff - sd_diff, ymax=mean_diff + sd_diff), width=0.2) +
+  labs(x="Dataset", y="Mean (H2O − SSDM)", title="Mean Difference ±1 SD") +
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+ggsave(file.path(out_dir, "mean_diff_sd.jpg"), p_mean, width=8, height=4)
+
+#Safe: build full difference dataframe
+all_diffs <- lapply(seq_along(diff_files), function(i) {
+  val <- values(rast(diff_files[i]))
+  val <- val[!is.na(val)]
+  tibble(dataset = ds_names[i], diff_value = val)
+}) %>% bind_rows()
+
+# Check
+print(head(all_diffs))
+
+# 📊 Boxplot of pixel-wise differences
+p_box <- ggplot(all_diffs, aes(x=dataset, y=diff_value)) +
+  geom_boxplot(fill="lightgreen") +
+  coord_flip() +
+  labs(x="Dataset", y="H2O − SSDM", title="Pixel-wise Difference Distribution") +
+  theme(axis.text.y=element_text(size=8))
+
+ggsave(file.path(out_dir, "boxplot_diff.jpg"), p_box, width=8, height=5)
+
+
+################################################################################
+# Interpretation:
+# This workflow highlights how different SDM pipelines can yield spatially 
+# varying suitability predictions. Strong correlation indicates agreement, 
+# but RMSE and Jaccard overlap show where spatial mismatches occur.
+# This is critical for transparent ecological interpretations and 
+# robust conservation planning under climate change scenarios.
+################################################################################
