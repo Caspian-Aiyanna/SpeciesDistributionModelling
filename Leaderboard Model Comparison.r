@@ -83,3 +83,71 @@ for (sp in names(species_dirs)) {
 }
 
 h2o.shutdown(prompt = FALSE)
+
+
+
+#Variable importance per each base learner model----
+library(h2o)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(patchwork)
+
+h2o.init()
+
+ensemble_paths <- list(
+  E3A = "D:/Harin/Projects/SDM/SDM/All/H2o_Results/A/thinned_E3A/StackedEnsemble_BestOfFamily_1_AutoML_9_20250701_140429",
+  E4A = "D:/Harin/Projects/SDM/SDM/All/H2o_Results/A/thinned_E4A/StackedEnsemble_AllModels_1_AutoML_10_20250701_141911"
+)
+
+data_paths <- list(
+  E3A = "D:/Harin/Projects/SDM/SDM/All/Data/A/thinned_E3A.csv",
+  E4A = "D:/Harin/Projects/SDM/SDM/All/Data/A/thinned_E4A.csv"
+)
+
+for (sp in names(ensemble_paths)) {
+  cat("🔍 Processing:", sp, "\n")
+  
+  ensemble <- h2o.loadModel(ensemble_paths[[sp]])
+  data <- h2o.importFile(data_paths[[sp]])
+  
+  combined_varimp <- data.frame(variable = character(), relative_importance = numeric())
+  
+  base_models <- ensemble@model$base_models
+  
+  for (base_name in base_models) {
+    base_model <- h2o.getModel(base_name)
+    if (grepl("Metalearner", base_name)) next
+    
+    cat("   📊 Base learner:", base_name, "\n")
+    
+    varimp <- h2o.varimp(base_model)
+    if (!is.null(varimp)) {
+      varimp_df <- as.data.frame(varimp)[, c("variable", "relative_importance")]
+      combined_varimp <- bind_rows(combined_varimp, varimp_df)
+    }
+  }
+  
+  if (nrow(combined_varimp) > 0) {
+    # Sum and normalize across base learners
+    combined_summary <- combined_varimp %>%
+      group_by(variable) %>%
+      summarise(relative_importance = sum(relative_importance)) %>%
+      mutate(relative_importance = relative_importance / sum(relative_importance) * 100) %>%
+      arrange(desc(relative_importance))
+    
+    p <- ggplot(combined_summary, aes(x = reorder(variable, relative_importance), y = relative_importance)) +
+      geom_col(fill = "#2c7fb8") +
+      coord_flip() +
+      labs(title = paste("Combined Variable Importance -", sp),
+           x = "Variable", y = "Relative Importance (%)") +
+      theme_minimal()
+    
+    ggsave(file.path(dirname(ensemble_paths[[sp]]), paste0("Combined_VarImp_", sp, ".jpg")),
+           plot = p, width = 8, height = 6, dpi = 300)
+  }
+}
+
+h2o.shutdown(prompt = FALSE)
+
