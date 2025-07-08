@@ -1,0 +1,414 @@
+library(raster)
+library(terra)
+library (SSDM)
+library(sf)
+library(caret)
+library(data.table)
+library(dplyr)
+library(terra)
+library(spocc)
+library(sf)
+library(ggplot2)
+library(readr)
+library(rnaturalearth)
+library(reshape2)
+library(SSDM)
+
+setwd("D:/Harin/Projects/SDM/BTEH")
+
+dir.create("Results/rda", recursive = TRUE, showWarnings = FALSE)
+dir.create("Results/rasters", recursive = TRUE, showWarnings = FALSE)
+
+# 1. Occurrence data
+
+# GPS Collar data for training the model
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(spThin)
+
+# Load and process multiple telemetry datasets----
+datasets <- c("data/occ/datasets_from OG/elephant/E1B.csv",
+              "data/occ/datasets_from OG/elephant/E2B.csv",
+              "data/occ/datasets_from OG/elephant/E3B.csv",
+              "data/occ/datasets_from OG/elephant/E3A.csv",
+              "data/occ/datasets_from OG/elephant/E4B.csv",
+              "data/occ/datasets_from OG/elephant/E4A.csv",
+              "data/occ/datasets_from OG/elephant/E5B.csv",
+              "data/occ/datasets_from OG/elephant/E5A.csv")
+data_list <- lapply(datasets, read.csv)
+combined_data <- do.call(rbind, data_list)
+head(combined_data)
+
+# Function to sample data from grid
+sample_from_grid <- function(collar_data, grid_size_km = 0.5, min_samples_per_cell = 50, min_total_samples = 700) {
+  collar_data$lat_bin <- cut(collar_data$lat, 
+                             breaks = seq(min(collar_data$lat), max(collar_data$lat), 
+                                          by = grid_size_km * 0.01),
+                             include.lowest = TRUE)
+  collar_data$lon_bin <- cut(collar_data$lon, 
+                             breaks = seq(min(collar_data$lon), max(collar_data$lon), 
+                                          by = grid_size_km * 0.01),
+                             include.lowest = TRUE)
+  
+  cell_counts <- collar_data %>%
+    group_by(lat_bin, lon_bin) %>%
+    summarise(count = n(), .groups = 'drop')
+  
+  valid_cells <- cell_counts %>%
+    filter(count >= min_samples_per_cell) %>%
+    select(lat_bin, lon_bin)
+  
+  collar_data_filtered <- collar_data %>%
+    inner_join(valid_cells, by = c("lat_bin", "lon_bin"))
+  
+  sampled_data <- collar_data_filtered %>%
+    group_by(lat_bin, lon_bin) %>%
+    group_modify(~{
+      n_points <- nrow(.x)
+      sample_size <- min(n_points, 
+                         max(min_samples_per_cell,
+                             ceiling(n_points * sqrt(n_points) / max(cell_counts$count))))
+      slice_sample(.x, n = sample_size)
+    }) %>%
+    ungroup()
+  
+  if (nrow(sampled_data) < min_total_samples) {
+    additional_needed <- min_total_samples - nrow(sampled_data)
+    extra_samples <- collar_data %>% anti_join(sampled_data, by = c("lat_bin", "lon_bin")) %>%
+      slice_sample(n = min(nrow(.), additional_needed))
+    sampled_data <- bind_rows(sampled_data, extra_samples)
+  }
+  
+  return(sampled_data)
+}
+
+# Process each dataset
+for (dataset in datasets) {
+  collar <- read.csv(dataset)
+  sampled_data <- sample_from_grid(collar, grid_size_km = 1, min_samples_per_cell = 50, min_total_samples = 700)
+  
+  thinned_data <- thin(
+    loc.data = sampled_data,
+    lat.col = "lat",
+    long.col = "lon",
+    spec.col = "species",
+    thin.par = 0.1,
+    reps = 100,
+    locs.thinned.list.return = TRUE,
+    write.files = FALSE
+  )
+  
+  output_filename <- paste0("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_dataset_", gsub(".csv", "", basename(dataset)), "_grid_1_sample_50_thin_0.1.csv")
+  write.csv(thinned_data[[1]], file = output_filename, row.names = FALSE)
+}
+
+
+#load the thinned datsets----
+E1B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E1B.csv")
+E2B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E2B.csv")
+E3B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E3B.csv")
+E4B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E4B.csv")
+E5B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E5B.csv")
+E3A<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E3B.csv")
+E4A<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E4B.csv")
+E5A<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E5B.csv")
+
+
+# 2. Environmental data for present----
+folders <- c("data/vairables/before", "data/vairables/after")
+envi_list <- list()
+
+for (folder in folders) {
+  raster_files <- list.files(path = folder, pattern = "\\.tif$", recursive = TRUE, full.names = TRUE)
+  raster_stack <- stack(raster_files)
+  names(raster_stack) <- gsub(".tif", "", basename(raster_files))
+  print(names(raster_stack))
+  # Load variables
+  raster_stack <- load_var(
+    files = raster_files,
+    categorical = c("Landcover"),
+    Norm = FALSE,
+    tmp = TRUE,
+    verbose = TRUE
+  )
+  envi_list[[folder]] <- raster_stack
+}
+sapply(envi_list, nlayers)
+envi_before <- envi_list[["data/vairables/before"]]
+envi_after <- envi_list[["data/vairables/after"]]
+
+##KENDAL test of variable selection is a correlation analysis identifies multicollinearity among variables using Kendall's correlation coefficient. Highly correlated predictors are removed based on a threshold of 0.7 to prevent redundancy and overfitting in the model.
+#Extract environmental values for occurrence points
+#Function
+perform_kendall_test <- function(occ_data, envi_stack) {
+  coords <- occ_data[, c("lon", "lat")] # Extract environmental values for occurrence points
+  variables_data <- raster::extract(envi_stack, coords)
+  variables_data <- na.omit(variables_data) # Remove rows with NA values
+  cor_matrix <- cor(variables_data, use = "complete.obs", method = "kendall") # Compute Kendall correlation matrix
+  to_remove <- findCorrelation(cor_matrix, cutoff = 0.7) # Identify highly correlated variables (threshold: 0.7)
+  envi_filtered <- dropLayer(envi_stack, to_remove)# Create new environmental stack without highly correlated variables
+  return(envi_filtered)
+}
+
+envi_E1B <- perform_kendall_test(E1B, envi_before)
+envi_E2B <- perform_kendall_test(E2B, envi_before)
+envi_E3B <- perform_kendall_test(E3B, envi_before)
+envi_E4B <- perform_kendall_test(E4B, envi_before)
+envi_E5B <- perform_kendall_test(E5B, envi_before)
+envi_E3A <- perform_kendall_test(E3A, envi_after)
+envi_E4A <- perform_kendall_test(E4A, envi_after)
+envi_E5A <- perform_kendall_test(E5A, envi_after)
+
+# 3. Model for the present day----
+ESDM_E1B <- ensemble_modelling(
+  c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM'),
+  E1B,
+  envi_E1B,
+  Xcol = 'lon',
+  Ycol = 'lat',
+  pcol = NULL,
+  rep = 10,
+  cores = 10,
+  cv = "holdout",
+  cv.param = c(0.75, 1),
+  ensemble.thresh = 0,
+  verbose = FALSE
+)
+save(ESDM_E1B, file = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E1B.rda")
+writeRaster(ESDM_E1B@projection, filename = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E1B", format = "GTiff")
+
+ESDM_E2B <- ensemble_modelling(
+  c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM'),
+  E2B,
+  envi_E2B,
+  Xcol = 'lon',
+  Ycol = 'lat',
+  pcol = NULL,
+  rep = 10,
+  cores = 10,
+  cv = "holdout",
+  cv.param = c(0.75, 1),
+  ensemble.thresh = 0,
+  verbose = FALSE
+)
+save(ESDM_E2B, file = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E2B.rda")
+writeRaster(ESDM_E2B@projection, filename = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E2B", format = "GTiff")
+
+ESDM_E3B <- ensemble_modelling(
+  c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM'),
+  E3B,
+  envi_E3B,
+  Xcol = 'lon',
+  Ycol = 'lat',
+  pcol = NULL,
+  rep = 10,
+  cores = 10,
+  cv = "holdout",
+  cv.param = c(0.75, 1),
+  ensemble.thresh = 0,
+  verbose = FALSE
+)
+save(ESDM_E3B, file = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E3B.rda")
+writeRaster(ESDM_E3B@projection, filename = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E3B", format = "GTiff")
+
+ESDM_E4B <- ensemble_modelling(
+  c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM'),
+  E4B,
+  envi_E4B,
+  Xcol = 'lon',
+  Ycol = 'lat',
+  pcol = NULL,
+  rep = 10,
+  cores = 10,
+  cv = "holdout",
+  cv.param = c(0.75, 1),
+  ensemble.thresh = 0,
+  verbose = FALSE
+)
+save(ESDM_E4B, file = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E4B.rda")
+writeRaster(ESDM_E4B@projection, filename = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E4B", format = "GTiff")
+
+ESDM_E5B <- ensemble_modelling(
+  c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM'),
+  E5B,
+  envi_E5B,
+  Xcol = 'lon',
+  Ycol = 'lat',
+  pcol = NULL,
+  rep = 10,
+  cores = 10,
+  cv = "holdout",
+  cv.param = c(0.75, 1),
+  ensemble.thresh = 0,
+  verbose = FALSE
+)
+save(ESDM_E5B, file = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E5B.rda")
+writeRaster(ESDM_E5B@projection, filename = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E5B", format = "GTiff")
+
+ESDM_E3A <- ensemble_modelling(
+  c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM'),
+  E3A,
+  envi_E3A,
+  Xcol = 'lon',
+  Ycol = 'lat',
+  pcol = NULL,
+  rep = 10,
+  cores = 10,
+  cv = "holdout",
+  cv.param = c(0.75, 1),
+  ensemble.thresh = 0,
+  verbose = FALSE
+)
+save(ESDM_E3A, file = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E3A.rda")
+writeRaster(ESDM_E3A@projection, filename = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E3A", format = "GTiff")
+
+ESDM_E4A <- ensemble_modelling(
+  c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM'),
+  E4A,
+  envi_E4A,
+  Xcol = 'lon',
+  Ycol = 'lat',
+  pcol = NULL,
+  rep = 10,
+  cores = 10,
+  cv = "holdout",
+  cv.param = c(0.75, 1),
+  ensemble.thresh = 0,
+  verbose = FALSE
+)
+save(ESDM_E4A, file = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E4A.rda")
+writeRaster(ESDM_E4A@projection, filename = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E4A", format = "GTiff")
+
+ESDM_E5A <- ensemble_modelling(
+  c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM'),
+  E5A,
+  envi_E5A,
+  Xcol = 'lon',
+  Ycol = 'lat',
+  pcol = NULL,
+  rep = 10,
+  cores = 10,
+  cv = "holdout",
+  cv.param = c(0.75, 1),
+  ensemble.thresh = 0,
+  verbose = FALSE
+)
+save(ESDM_E5A, file = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E5A.rda")
+writeRaster(ESDM_E5A@projection, filename = "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/ESDM_E5A", format = "GTiff")
+
+
+
+plot(ESDM_E1B)
+plot(ESDM_E2B)
+plot(ESDM_E3B)
+plot(ESDM_E3A)
+plot(ESDM_E4B)
+plot(ESDM_E4A)
+plot(ESDM_E5B)
+plot(ESDM_E5A)
+
+
+#SSDM
+# Compile all models into a list
+ESDM_models <- list(
+  Spring = ESDM_Spring,
+  Fall = ESDM_fall,
+  Summer = ESDM_summer,
+  Winter = ESDM_winter,
+  Year_2022 = ESDM_2022,
+  Year_2023 = ESDM_2023,
+  Year_2024 = ESDM_2024,
+  Elephant_1 = ESDM_ele_1,
+  Elephant_2 = ESDM_ele_2,
+  Elephant_3 = ESDM_ele_3,
+  Elephant_4 = ESDM_ele_4
+)
+#save(ESDM_models, file = "Results/SSDM/ESDM_models.rda")
+ESDM_ele_1@name <- "ele_1"
+ESDM_ele_2@name <- "ele_2"
+ESDM_ele_3@name <- "ele_3"
+ESDM_ele_4@name <- "ele_4"
+
+SSDM <- stacking(ESDM_ele_1, ESDM_ele_2, ESDM_ele_3, ESDM_ele_4)
+
+
+
+# 4. Process results----
+# Load model list
+
+output_dir <- "Results/Outputs/"
+
+evaluation_results <- list()
+
+evaluate_model <- function(model_name, model) {
+  cat("Processing model:", model_name, "\n")
+  
+  # List all available slots in the model
+  all_slots <- slotNames(model)
+  print(all_slots)
+  
+  # Extract evaluation metrics
+  evaluation_metrics <- model@evaluation
+  evaluation_df <- as.data.frame(evaluation_metrics)
+  evaluation_df$Model <- model_name
+  evaluation_results[[model_name]] <- evaluation_df
+  
+  # Save individual model evaluation
+  write.csv(evaluation_df, paste0(output_dir, model_name, "_evaluation_metrics.csv"), row.names = FALSE)
+  
+  # Extract and save variable importance
+  variable_importance <- as.data.frame(model@variable.importance)
+  if(ncol(variable_importance) > 1) {
+    variable_importance <- data.frame(
+      Variable = rep(names(variable_importance), each = nrow(variable_importance)),
+      Importance = unlist(variable_importance, use.names = FALSE)
+    )
+  }
+  
+  # Save variable importance plot
+  ggplot(variable_importance, aes(x = reorder(Variable, Importance), y = Importance, fill = Variable)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    theme_minimal() +
+    theme(legend.position = "none") +
+    labs(title = paste("Variable Importance -", model_name), x = "Variables", y = "Importance")
+  ggsave(paste0(output_dir, "variable_importance_", model_name, ".png"))
+  
+  # Extract and save algorithm correlation
+  algorithm_correlation <- model@algorithm.correlation
+  write.csv(as.data.frame(algorithm_correlation), paste0(output_dir, model_name, "_algorithm_correlation.csv"))
+  
+  # Plot algorithm correlation heatmap
+  if (!is.matrix(algorithm_correlation)) {
+    algorithm_correlation <- as.matrix(algorithm_correlation)
+  }
+  algorithm_names <- c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM')
+  rownames(algorithm_correlation) <- algorithm_names
+  colnames(algorithm_correlation) <- algorithm_names
+  
+  corr_df <- melt(algorithm_correlation)
+  colnames(corr_df) <- c("Algorithm1", "Algorithm2", "Correlation")
+  
+  ggplot(corr_df, aes(x = Algorithm1, y = Algorithm2, fill = Correlation)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+    geom_text(aes(label = round(Correlation, 2)), color = "black", size = 4) +
+    labs(title = paste("Algorithm Correlation -", model_name), x = "Algorithm", y = "Algorithm", fill = "Correlation") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(paste0(output_dir, model_name, "_algorithm_correlation_heatmap.png"))
+  
+  # Extract and save binary map
+  binary_map <- model@binary
+  writeRaster(binary_map, paste0(output_dir, model_name, "_binary_map.tif"), format = "GTiff", overwrite = TRUE)
+  
+  cat("Completed processing for", model_name, "\n\n")
+}
+
+# Loop through all models in the list
+lapply(names(ESDM_models), function(name) evaluate_model(name, ESDM_models[[name]]))
+
+# Combine all evaluation metrics into one CSV file
+evaluation_results_df <- do.call(rbind, evaluation_results)
+write.csv(evaluation_results_df, paste0(output_dir, "All_Models_Evaluation_Metrics.csv"), row.names = FALSE)
