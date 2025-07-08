@@ -1,0 +1,122 @@
+library(raster)
+library(terra)
+library(SSDM)
+library(sf)
+library(caret)
+library(data.table)
+library(dplyr)
+library(spocc)
+library(ggplot2)
+library(readr)
+library(rnaturalearth)
+library(reshape2)
+library(spThin)
+
+setwd("D:/Harin/Projects/SDM/BTEH")
+
+dir.create("Results/rda", recursive = TRUE, showWarnings = FALSE)
+dir.create("Results/rasters", recursive = TRUE, showWarnings = FALSE)
+
+# Loading individual thinned elephant datsets before and after fence removal----
+# datasets <- list.files("data/occ/datasets_from OG/elephant", pattern = ".csv$", full.names = TRUE)
+# data_list <- lapply(datasets, read.csv)
+# combined_data <- do.call(rbind, data_list)
+# head(combined_data)
+
+# E1B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E1B.csv")
+# E2B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E2B.csv")
+# E3B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E3B.csv")
+# E4B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E4B.csv")
+# E5B<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E5B.csv")
+# E3A<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E3A.csv")
+# E4A<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E4A.csv")
+# E5A<- read.csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/thinned_E5A.csv")
+
+#Loading thinned datasets for model building
+thinned_filenames <- list.files(
+  "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant", 
+  pattern = "thinned_.*\\.csv$", 
+  full.names = TRUE
+)
+dataset_names <- gsub(".csv$", "", basename(thinned_filenames))
+thinned_data_list <- lapply(thinned_filenames, read.csv)
+names(thinned_data_list) <- dataset_names
+
+#Loading environmental data (Rasters)
+folders <- c("data/vairables/before", "data/vairables/after")
+envi_list <- list()
+for (folder in folders) {
+  raster_files <- list.files(path = folder, pattern = ".tif$", recursive = TRUE, full.names = TRUE)
+  raster_stack <- stack(raster_files)
+  raster_stack <- load_var(files = raster_files, categorical = c("Landcover"), Norm = FALSE, tmp = TRUE, verbose = TRUE)
+  envi_list[[folder]] <- raster_stack
+}
+
+envi_before <- envi_list[["data/vairables/before"]]
+envi_after <- envi_list[["data/vairables/after"]]
+
+#Kendall correlation test function for each dataset
+perform_kendall_test <- function(occ_data, envi_stack) {
+  coords <- occ_data[, c("lon", "lat")]
+  variables_data <- raster::extract(envi_stack, coords)
+  variables_data <- na.omit(variables_data)
+  cor_matrix <- cor(variables_data, use = "complete.obs", method = "kendall")
+  to_remove <- findCorrelation(cor_matrix, cutoff = 0.7)
+  envi_filtered <- dropLayer(envi_stack, to_remove)
+  return(envi_filtered)
+}
+
+filtered_envi <- list()
+for (name in names(thinned_data_list)) {
+  dataset <- thinned_data_list[[name]]
+  if (grepl("A", name)) {
+    env_source <- envi_after
+  } else {
+    env_source <- envi_before
+  }
+  filtered_envi[[name]] <- perform_kendall_test(dataset, env_source)
+}
+
+#ESDM Model fitting loop
+for (name in names(thinned_data_list)) {
+  dataset <- thinned_data_list[[name]]
+  envi_data <- filtered_envi[[name]]
+  
+  model <- ensemble_modelling(
+    c('SVM', 'MARS', 'RF', 'GLM', 'ANN', 'CTA', 'GBM'),
+    dataset, envi_data,
+    Xcol = 'lon', Ycol = 'lat',
+    pcol = NULL, rep = 10, cores = 10,
+    cv = "holdout", cv.param = c(0.75, 1),
+    ensemble.thresh = 0, overwrite=TRUE, verbose = FALSE)
+  
+  save(model, file = paste0("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/models/", name, ".rda"))
+  writeRaster(model@projection, filename = paste0("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/rasters/", name), format = "GTiff")
+  plot(model)
+}
+for (name in names(data_list)) {
+  model <- get(name)
+  save(model, file = paste0("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/models/", name, ".rda"))
+  writeRaster(model@projection, 
+              filename = paste0("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/rasters/", name, ".tif"), 
+              format = "GTiff")
+  #plot(model)
+}
+
+# Extract and save evaluation metrics
+evaluation_metrics <- data.frame()
+for (i in seq_along(ensemble_results)) {
+  metrics <- slot(ensemble_results[[i]], "evaluation")
+  metrics_df <- as.data.frame(metrics)
+  metrics_df$Dataset <- names(ensemble_results)[i]
+  evaluation_metrics <- rbind(evaluation_metrics, metrics_df)
+}
+write.csv(evaluation_metrics, "D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/results/ensemble_evaluation_metrics_with_models.csv", row.names = FALSE)
+
+# Plot evaluation metrics
+ensemble_evaluation_metrics_with_models <- read_csv("D:/Harin/Projects/SDM/BTEH/data/occ/thinned_DBSCAN/elephant/results/ensemble_evaluation_metrics_with_models.csv")
+ggplot(ensemble_evaluation_metrics_with_models, aes(x = Model, y = AUC, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Evaluation Metrics: AUC by Model and Dataset", x = "Model", y = "AUC") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
